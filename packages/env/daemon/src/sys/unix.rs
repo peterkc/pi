@@ -304,7 +304,10 @@ pub fn configure(
     unsafe {
         command.pre_exec(|| {
             // A new session, so a kill reaches every descendant; default signal handling and an empty mask, as libuv sets.
-            libc::setsid();
+            // `kill_tree` signals only the group, so a child that is not a group leader must not start.
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
             for signal in 1..32 {
                 if signal != libc::SIGKILL && signal != libc::SIGSTOP {
                     libc::signal(signal, libc::SIG_DFL);
@@ -343,14 +346,12 @@ pub fn on_exit_signal(on_signal: impl FnOnce(i32) + Send + 'static) {
     });
 }
 
-/// Kill the command's process group, or the process if the group is gone.
+/// Kill only the command's process group: after reaping, the bare pid may belong to another process.
 pub fn kill_tree(pid: u32) {
     let pid = pid as i32;
-    // SAFETY: plain signal delivery.
+    // SAFETY: plain signal delivery to the group established before spawn returned.
     unsafe {
-        if libc::kill(-pid, libc::SIGKILL) != 0 {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        libc::kill(-pid, libc::SIGKILL);
     }
 }
 
@@ -428,6 +429,29 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::{Duration, Instant};
+
+    /// Given a child outside its own group, when its group is absent, then no bare pid is signalled.
+    // Regression for peterkc/pi#1.
+    #[test]
+    fn given_no_process_group_when_killed_then_bare_pid_is_not_signalled() {
+        use std::io::Write;
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read line; printf alive"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        kill_tree(child.id());
+        let written = child.stdin.take().unwrap().write_all(b"go\n");
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            written.is_ok(),
+            "kill_tree killed a process outside its own group"
+        );
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"alive");
+    }
 
     #[test]
     fn ending_a_group_kills_what_the_program_left_running() {
